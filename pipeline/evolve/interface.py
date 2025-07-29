@@ -1,117 +1,31 @@
-from datetime import datetime
+from .prompt import Planner_input, Motivation_checker_input, Deduplication_input, CodeChecker_input
+from .model import planner, motivation_checker, deduplication, code_checker
+from agents import exceptions, set_tracing_disabled
 from typing import List, Tuple
-
-from agents import exceptions
 from config import Config
-from database.mongo_database import create_client
+from database.mongo_database import create_admin_client
 from utils.agent_logger import log_agent_run
-from .model import code_checker, creator, motivation_checker, optimizer
-from .prompt import (
-    CodeChecker_input,
-    Creator_input,
-    Creator_input_dedup,
-    Motivation_checker_input,
-    Optimizer_input,
-    Optimizer_input_dedup
-)
 
+set_tracing_disabled(True)
 
-async def evolve(context: str, mode: str) -> Tuple[str, str]:
-    """
-    Evolve code based on context and mode.
-    
-    Args:
-        context: Context for evolution
-        mode: Evolution mode ('create' or 'optimize')
-        
-    Returns:
-        Tuple of (name, motivation) or error information
-    """
-    if mode == 'create':
-        return await create(context)
-    elif mode == 'optimize':
-        return await optimize(context)
-    else:
-        return "Failed", "mode error"
-
-
-async def create(context: str) -> Tuple[str, str]:
-    """
-    Create new code variant based on context.
-    
-    Args:
-        context: Context for creation
-        
-    Returns:
-        Tuple of (timestamped_name, motivation) or error information
-    """
+async def evolve(context: str) -> Tuple[str, str]:
     for attempt in range(Config.MAX_RETRY_ATTEMPTS):
-        with open(Config.SOURCE_FILE, 'r', encoding='utf-8') as f:
+        with open(Config.SOURCE_FILE, 'r') as f:
             original_source = f.read()
             
-        name, motivation = await creating(context)
-        
-        # Generate timestamp prefix (format: YYYYMMDD-HH:MM:SS)
-        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
-        
-        # Add timestamp prefix to name
-        timestamped_name = f"{timestamp}-{name}"
+        name, motivation = await gen(context)
         
         if await check_code_correctness(motivation):
-            return timestamped_name, motivation
+            return name, motivation
 
-        with open(Config.SOURCE_FILE, 'w', encoding='utf-8') as f:
+        with open(Config.SOURCE_FILE, 'w') as f:
             f.write(original_source)
         print("Try new motivations")
-    return "Failed", "create error"
-
-
-async def optimize(context: str) -> Tuple[str, str]:
-    """
-    Optimize existing code based on context.
+    return "Failed", "evolve error"
     
-    Args:
-        context: Context for optimization
-        
-    Returns:
-        Tuple of (timestamped_name, motivation) or error information
-    """
-    for attempt in range(Config.MAX_RETRY_ATTEMPTS):
-        with open(Config.SOURCE_FILE, 'r', encoding='utf-8') as f:
-            original_source = f.read()
-            
-        name, motivation = await optimizing(context)
-        
-        # Generate timestamp prefix (format: YYYYMMDD-HH:MM:SS)
-        timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
-        
-        # Add timestamp prefix to name
-        timestamped_name = f"{timestamp}-{name}"
-        
-        if await check_code_correctness(motivation):
-            return timestamped_name, motivation
-
-        with open(Config.SOURCE_FILE, 'w', encoding='utf-8') as f:
-            f.write(original_source)
-        print("Try new motivations")
-    return "Failed", "optimize error"
-
-
-async def creating(context: str) -> Tuple[str, str]:
-    """
-    Create new code with deduplication retry mechanism.
-    
-    Args:
-        context: Context for creation
-        
-    Returns:
-        Tuple of (name, motivation)
-        
-    Raises:
-        Exception: When maximum retry attempts reached or other errors occur
-    """
+async def gen(context: str) -> Tuple[str, str]:
     # Save original file content
-    with open(Config.SOURCE_FILE, 'r', encoding='utf-8') as f:
+    with open(Config.SOURCE_FILE, 'r') as f:
         original_source = f.read()
         
     repeated_result = None
@@ -120,115 +34,40 @@ async def creating(context: str) -> Tuple[str, str]:
     for attempt in range(Config.MAX_RETRY_ATTEMPTS):
         try:
             # Restore original file
-            with open(Config.SOURCE_FILE, 'w', encoding='utf-8') as f:
+            with open(Config.SOURCE_FILE, 'w') as f:
                 f.write(original_source)
             
-            # Use different prompts based on repetition status
+            # Use different prompt based on whether it's repeated
             plan = None
             if attempt == 0:
-                input_data = Creator_input(context)
-                plan = await log_agent_run("creator", creator, input_data)
+                input = Planner_input(context)
+                plan = await log_agent_run("planner", planner, input)
             else:
-                repeated_context = get_repeated_context(repeated_result.repeated_index)
-                input_data = Creator_input_dedup(context, repeated_context)
-                plan = await log_agent_run("creator", creator, input_data)
+                repeated_context = await get_repeated_context(repeated_result.repeated_index)
+                input = Deduplication_input(context, repeated_context)
+                plan = await log_agent_run("deduplication", deduplication, input)
                 
             name, motivation = plan.final_output.name, plan.final_output.motivation
             
             repeated_result = await check_repeated_motivation(motivation)
             if repeated_result.is_repeated:
-                print(
-                    f"Attempt {attempt + 1}: Motivation repeated, "
-                    f"index: {repeated_result.repeated_index}"
-                )
+                print(f"Attempt {attempt + 1}: Motivation repeated, index is {repeated_result.repeated_index}")
                 if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
-                    raise Exception(
-                        "Maximum retry attempts reached, unable to generate non-repeated motivation"
-                    )
+                    raise Exception("Maximum retry attempts reached, unable to generate non-repeated motivation")
                 continue
             else:
-                print(f"Attempt {attempt + 1}: Motivation not repeated, continuing execution")
+                print(f"Attempt {attempt + 1}: Motivation not repeated, continue execution")
                 print(motivation)
                 return name, motivation
                 
         except exceptions.MaxTurnsExceeded as e:
-            print(f"Attempt {attempt + 1}: Exceeded maximum dialogue turns")
+            print(f"Attempt {attempt + 1} exceeded maximum dialogue turns")
         except Exception as e:
             print(f"Attempt {attempt + 1} error: {e}")
             raise e
 
-
-async def optimizing(context: str) -> Tuple[str, str]:
-    """
-    Optimize code with deduplication retry mechanism.
-    
-    Args:
-        context: Context for optimization
-        
-    Returns:
-        Tuple of (name, motivation)
-        
-    Raises:
-        Exception: When maximum retry attempts reached or other errors occur
-    """
-    # Save original file content
-    with open(Config.SOURCE_FILE, 'r', encoding='utf-8') as f:
-        original_source = f.read()
-        
-    repeated_result = None
-    motivation = None
-    
-    for attempt in range(Config.MAX_RETRY_ATTEMPTS):
-        try:
-            # Restore original file
-            with open(Config.SOURCE_FILE, 'w', encoding='utf-8') as f:
-                f.write(original_source)
-            
-            # Use different prompts based on repetition status
-            plan = None
-            if attempt == 0:
-                input_data = Optimizer_input(context)
-                plan = await log_agent_run("optimizer", optimizer, input_data)
-            else:
-                repeated_context = get_repeated_context(repeated_result.repeated_index)
-                input_data = Optimizer_input_dedup(context, repeated_context)
-                plan = await log_agent_run("optimizer", optimizer, input_data)
-                
-            name, motivation = plan.final_output.name, plan.final_output.motivation
-            
-            repeated_result = await check_repeated_motivation(motivation)
-            if repeated_result.is_repeated:
-                print(
-                    f"Attempt {attempt + 1}: Motivation repeated, "
-                    f"index: {repeated_result.repeated_index}"
-                )
-                if attempt == Config.MAX_RETRY_ATTEMPTS - 1:
-                    raise Exception(
-                        "Maximum retry attempts reached, unable to generate non-repeated motivation"
-                    )
-                continue
-            else:
-                print(f"Attempt {attempt + 1}: Motivation not repeated, continuing execution")
-                print(motivation)
-                return name, motivation
-                
-        except exceptions.MaxTurnsExceeded as e:
-            print(f"Attempt {attempt + 1}: Exceeded maximum dialogue turns")
-        except Exception as e:
-            print(f"Attempt {attempt + 1} error: {e}")
-            raise e
-
-
-async def check_code_correctness(motivation: str) -> bool:
-    """
-    Check code correctness using code checker.
-    
-    Args:
-        motivation: Motivation for the code check
-        
-    Returns:
-        True if code is correct, False otherwise
-    """
+async def check_code_correctness(motivation) -> bool:
+    """Check code correctness"""
     for attempt in range(Config.MAX_RETRY_ATTEMPTS):
         try:
             code_checker_result = await log_agent_run(
@@ -256,34 +95,18 @@ async def check_code_correctness(motivation: str) -> bool:
             print(f"Code checker error: {e}")
             return False
 
-
 async def check_repeated_motivation(motivation: str):
-    """
-    Check if motivation is repeated using similarity search.
-    
-    Args:
-        motivation: Motivation text to check
-        
-    Returns:
-        Result indicating if motivation is repeated
-    """
-    client = create_client()
+    client = create_admin_client()
     similar_elements = client.search_similar_motivations(motivation)
     context = similar_motivation_context(similar_elements)
-    input_data = Motivation_checker_input(context, motivation)
-    repeated_result = await log_agent_run("motivation_checker", motivation_checker, input_data)
+    input = Motivation_checker_input(context, motivation)
+    repeated_result = await log_agent_run("motivation_checker", motivation_checker, input)
     return repeated_result.final_output
 
 
 def similar_motivation_context(similar_elements: list) -> str:
     """
-    Generate structured context from similar motivation elements.
-    
-    Args:
-        similar_elements: List of similar motivation elements
-        
-    Returns:
-        Formatted context string
+    Generate structured context from similar motivation elements
     """
     if not similar_elements:
         return "No previous motivations found for comparison."
@@ -299,18 +122,11 @@ def similar_motivation_context(similar_elements: list) -> str:
     
     return context
 
-
-def get_repeated_context(repeated_index: List[int]) -> str:
+def get_repeated_context(repeated_index: list[int]) -> str:
     """
-    Generate structured context from repeated motivation experiments.
-    
-    Args:
-        repeated_index: List of indices for repeated experiments
-        
-    Returns:
-        Formatted context string for repeated experiments
+    Generate structured context from repeated motivation experiments
     """
-    client = create_client()
+    client = create_admin_client()
     repeated_elements = [client.get_elements_by_index(index) for index in repeated_index]
     
     if not repeated_elements:
@@ -322,21 +138,11 @@ def get_repeated_context(repeated_index: List[int]) -> str:
         structured_context += f"**Experiment #{i} - Index {element.index}**\n"
         structured_context += f"```\n{element.motivation}\n```\n\n"
     
-    structured_context += "**Pattern Analysis Summary:**\n"
+    structured_context += f"**Pattern Analysis Summary:**\n"
     structured_context += f"- **Total Repeated Experiments**: {len(repeated_elements)}\n"
-    structured_context += (
-        "- **Innovation Challenge**: Break free from these established pattern spaces\n"
-    )
-    structured_context += (
-        "- **Differentiation Requirement**: Implement orthogonal approaches that explore "
-        "fundamentally different design principles\n\n"
-    )
+    structured_context += f"- **Innovation Challenge**: Break free from these established pattern spaces\n"
+    structured_context += f"- **Differentiation Requirement**: Implement orthogonal approaches that explore fundamentally different design principles\n\n"
     
-    structured_context += (
-        "**Key Insight**: The above experiments represent exhausted design spaces. "
-        "Your task is to identify and implement approaches that operate on completely "
-        "different mathematical, biological, or physical principles to achieve "
-        "breakthrough innovation.\n"
-    )
+    structured_context += f"**Key Insight**: The above experiments represent exhausted design spaces. Your task is to identify and implement approaches that operate on completely different mathematical, biological, or physical principles to achieve breakthrough innovation.\n"
     
     return structured_context
