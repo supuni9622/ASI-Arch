@@ -6,8 +6,6 @@ from config import Config
 from database.mongo_database import create_admin_client
 from utils.agent_logger import log_agent_run
 
-set_tracing_disabled(True)
-
 async def evolve(context: str) -> Tuple[str, str]:
     for attempt in range(Config.MAX_RETRY_ATTEMPTS):
         with open(Config.SOURCE_FILE, 'r') as f:
