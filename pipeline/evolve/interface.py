@@ -3,7 +3,7 @@ from .model import planner, motivation_checker, deduplication, code_checker
 from agents import exceptions, set_tracing_disabled
 from typing import List, Tuple
 from config import Config
-from database.mongo_database import create_admin_client
+from database.mongo_database import create_client
 from utils.agent_logger import log_agent_run
 
 async def evolve(context: str) -> Tuple[str, str]:
@@ -94,7 +94,7 @@ async def check_code_correctness(motivation) -> bool:
             return False
 
 async def check_repeated_motivation(motivation: str):
-    client = create_admin_client()
+    client = create_client()
     similar_elements = client.search_similar_motivations(motivation)
     context = similar_motivation_context(similar_elements)
     input = Motivation_checker_input(context, motivation)
@@ -124,7 +124,7 @@ def get_repeated_context(repeated_index: list[int]) -> str:
     """
     Generate structured context from repeated motivation experiments
     """
-    client = create_admin_client()
+    client = create_client()
     repeated_elements = [client.get_elements_by_index(index) for index in repeated_index]
     
     if not repeated_elements:
